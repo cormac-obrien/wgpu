@@ -26,6 +26,7 @@
 #define ATTACHMENTS_LENGTH (1)
 #define RENDER_PASS_ATTACHMENTS_LENGTH (1)
 #define BIND_GROUP_LAYOUTS_LENGTH (1)
+#define MSAA_SAMPLES (4)
 
 WGPUByteArray read_file(const char *name) {
     FILE *file = fopen(name, "rb");
@@ -140,7 +141,7 @@ int main() {
                         .vertex_buffers = NULL,
                         .vertex_buffers_count = 0,
                     },
-                .sample_count = 1,
+                .sample_count = MSAA_SAMPLES,
             });
 
     if (!glfwInit()) {
@@ -222,10 +223,30 @@ int main() {
         WGPUCommandEncoderId cmd_encoder = wgpu_device_create_command_encoder(
             device, &(WGPUCommandEncoderDescriptor){.todo = 0});
 
+        WGPUExtent3d tex_size = {
+            .width = (uint32_t)width,
+            .height = (uint32_t)height,
+            .depth = 1,
+        };
+
+        WGPUTextureId ms_target = wgpu_device_create_texture(
+            device, &(WGPUTextureDescriptor){
+                .size = tex_size,
+                .array_layer_count = 1,
+                .mip_level_count = 1,
+                .sample_count = MSAA_SAMPLES,
+                .dimension = WGPUTextureDimension_D2,
+                .format = WGPUTextureFormat_Bgra8Unorm,
+                 .usage = WGPUTextureUsage_OUTPUT_ATTACHMENT,
+            });
+
+        WGPUTextureViewId ms_view = wgpu_texture_create_default_view(ms_target);
+
         WGPURenderPassColorAttachmentDescriptor
             color_attachments[ATTACHMENTS_LENGTH] = {
                 {
-                    .attachment = next_texture.view_id,
+                    .attachment = ms_view,
+                    .resolve_target = &next_texture.view_id,
                     .load_op = WGPULoadOp_Clear,
                     .store_op = WGPUStoreOp_Store,
                     .clear_color = WGPUColor_GREEN,

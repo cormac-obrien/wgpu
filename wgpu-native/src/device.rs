@@ -90,11 +90,17 @@ enum HostMap {
 pub(crate) struct AttachmentData<T> {
     pub colors: ArrayVec<[T; MAX_COLOR_TARGETS]>,
     pub depth_stencil: Option<T>,
+    pub resolves: Option<ArrayVec<[T; MAX_COLOR_TARGETS]>>,
 }
 impl<T: PartialEq> Eq for AttachmentData<T> {}
 impl<T> AttachmentData<T> {
     pub(crate) fn all(&self) -> impl Iterator<Item = &T> {
-        self.colors.iter().chain(&self.depth_stencil)
+        self.colors.iter()
+            .chain(&self.depth_stencil)
+            .chain(match self.resolves {
+                Some(ref rs) => rs.as_slice(),
+                None => &[]
+            })
     }
 }
 
@@ -1376,28 +1382,49 @@ pub fn device_create_render_pipeline(
             stencil_ops: hal::pass::AttachmentOps::PRESERVE,
             layouts: hal::image::Layout::General .. hal::image::Layout::General,
         }),
+        resolves: if desc.sample_count > 1 {
+            Some(color_states
+                 .iter()
+                 .map(|at| hal::pass::Attachment {
+                     format: Some(conv::map_texture_format(at.format)),
+                     samples: 1,
+                     ops: hal::pass::AttachmentOps::PRESERVE,
+                     stencil_ops: hal::pass::AttachmentOps::DONT_CARE,
+                     layouts: hal::image::Layout::General .. hal::image::Layout::General,
+                 })
+                 .collect(),
+            )
+        } else {
+            None
+        }
     };
 
     let mut render_pass_cache = device.render_passes.lock();
     let main_pass = match render_pass_cache.entry(rp_key) {
         Entry::Occupied(e) => e.into_mut(),
         Entry::Vacant(e) => {
-            let color_ids = [
-                (0, hal::image::Layout::ColorAttachmentOptimal),
-                (1, hal::image::Layout::ColorAttachmentOptimal),
-                (2, hal::image::Layout::ColorAttachmentOptimal),
-                (3, hal::image::Layout::ColorAttachmentOptimal),
-            ];
-            let depth_id = (
-                desc.color_states_length,
-                hal::image::Layout::DepthStencilAttachmentOptimal,
-            );
+            let mut ids: ArrayVec<[_; 2 * MAX_COLOR_TARGETS + 1]> = ArrayVec::new();
+            for i in 0..desc.color_states_length {
+                ids.push((i, hal::image::Layout::ColorAttachmentOptimal));
+            }
+            let depth_id = ids.len();
+            if let Some(_) = depth_stencil_state {
+                ids.push((ids.len(), hal::image::Layout::DepthStencilAttachmentOptimal));
+            }
+            let resolve_start = ids.len();
+            for i in 0..desc.color_states_length {
+                ids.push((ids.len() + i, hal::image::Layout::ColorAttachmentOptimal));
+            }
 
             let subpass = hal::pass::SubpassDesc {
-                colors: &color_ids[.. desc.color_states_length],
-                depth_stencil: depth_stencil_state.map(|_| &depth_id),
+                colors: &ids[.. depth_id],
+                depth_stencil: depth_stencil_state.map(|_| &ids[depth_id]),
                 inputs: &[],
-                resolves: &[],
+                resolves: if desc.sample_count > 1 {
+                    &ids[resolve_start ..]
+                } else {
+                    &[]
+                },
                 preserves: &[],
             };
 
@@ -1538,6 +1565,11 @@ pub fn device_create_render_pipeline(
     let pass_context = RenderPassContext {
         colors: color_states.iter().map(|state| state.format).collect(),
         depth_stencil: depth_stencil_state.map(|state| state.format),
+        resolves: if desc.sample_count > 1 {
+            Some(color_states.iter().map(|state| state.format).collect())
+        } else {
+            None
+        },
     };
 
     let mut flags = pipeline::PipelineFlags::empty();

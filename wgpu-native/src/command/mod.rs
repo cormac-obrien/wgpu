@@ -15,6 +15,7 @@ use crate::{
         all_buffer_stages,
         all_image_stages,
         FramebufferKey,
+        MAX_COLOR_TARGETS,
         RenderPassContext,
         RenderPassKey,
     },
@@ -40,6 +41,7 @@ use crate::{
 #[cfg(feature = "local")]
 use crate::{ComputePassId, RenderPassId};
 
+use arrayvec::ArrayVec;
 use back::Backend;
 use hal::{command::RawCommandBuffer, Device as _};
 use log::trace;
@@ -246,7 +248,9 @@ pub fn command_encoder_begin_render_pass(
                 &view.texture_id.ref_count,
                 TextureUsage::empty(),
             );
+
             let (_, layout) = conv::map_texture_state(query.usage, hal::format::Aspects::COLOR);
+
             hal::pass::Attachment {
                 format: Some(conv::map_texture_format(view.format)),
                 samples: view.samples,
@@ -256,9 +260,59 @@ pub fn command_encoder_begin_render_pass(
             }
         });
 
+        let colors = color_keys.collect();
+
+        let resolve_keys = if !color_attachments[0].resolve_target.is_null() {
+            // TODO: how to handle invalid case where not all color targets have resolves
+            Some(color_attachments.iter().map(|at| {
+                let id = unsafe { *at.resolve_target.as_ref().unwrap() };
+                let view = &view_guard[id];
+
+                if view.is_owned_by_swap_chain {
+                    let link = match HUB.textures.read()[view.texture_id.value].placement {
+                        TexturePlacement::SwapChain(ref link) => SwapChainLink {
+                            swap_chain_id: link.swap_chain_id.clone(),
+                            epoch: *link.epoch.lock(),
+                            image_index: link.image_index,
+                        },
+                        TexturePlacement::Memory(_) | TexturePlacement::Void => unreachable!(),
+                    };
+                    swap_chain_links.push(link);
+                }
+
+                if let Some(ex) = extent {
+                    assert_eq!(ex, view.extent);
+                } else {
+                    extent = Some(view.extent)
+                }
+
+                trackers
+                    .views
+                    .query(id, &view.life_guard.ref_count, DummyUsage);
+                let query = trackers.textures.query(
+                    view.texture_id.value,
+                    &view.texture_id.ref_count,
+                    TextureUsage::empty(),
+                );
+
+                let (_, layout) = conv::map_texture_state(query.usage, hal::format::Aspects::COLOR);
+
+                hal::pass::Attachment {
+                    format: Some(conv::map_texture_format(view.format)),
+                    samples: view.samples,
+                    ops: conv::map_load_store_ops(at.load_op, at.store_op),
+                    stencil_ops: hal::pass::AttachmentOps::DONT_CARE,
+                    layouts: layout .. layout,
+                }
+            }))
+        } else {
+            None
+        };
+
         RenderPassKey {
-            colors: color_keys.collect(),
+            colors,
             depth_stencil,
+            resolves: resolve_keys.map(|rk| rk.collect()),
         }
     };
 
@@ -266,24 +320,32 @@ pub fn command_encoder_begin_render_pass(
     let render_pass = match render_pass_cache.entry(rp_key.clone()) {
         Entry::Occupied(e) => e.into_mut(),
         Entry::Vacant(e) => {
-            let color_ids = [
-                (0, hal::image::Layout::ColorAttachmentOptimal),
-                (1, hal::image::Layout::ColorAttachmentOptimal),
-                (2, hal::image::Layout::ColorAttachmentOptimal),
-                (3, hal::image::Layout::ColorAttachmentOptimal),
-            ];
-            let depth_id = (
-                color_attachments.len(),
-                hal::image::Layout::DepthStencilAttachmentOptimal,
-            );
+            let mut ids: ArrayVec<[_; 2 * MAX_COLOR_TARGETS + 1]> = ArrayVec::new();
+            for i in 0..color_attachments.len() {
+                ids.push((i, hal::image::Layout::ColorAttachmentOptimal));
+            }
+            let depth_id = ids.len();
+            if let Some(_) = depth_stencil_attachment {
+                ids.push((ids.len(), hal::image::Layout::DepthStencilAttachmentOptimal));
+            }
+            let resolve_start = ids.len();
+            for i in 0..color_attachments.len() {
+                ids.push((ids.len() + i, hal::image::Layout::ColorAttachmentOptimal));
+            }
 
             let subpass = hal::pass::SubpassDesc {
-                colors: &color_ids[.. color_attachments.len()],
-                depth_stencil: depth_stencil_attachment.map(|_| &depth_id),
+                colors: &ids[.. depth_id],
+                depth_stencil: depth_stencil_attachment.map(|_| &ids[depth_id]),
                 inputs: &[],
-                resolves: &[],
+                resolves: if !color_attachments[0].resolve_target.is_null() {
+                    &ids[resolve_start ..]
+                } else {
+                    &[]
+                },
                 preserves: &[],
             };
+
+            println!("{:?}", e.key());
 
             let pass = unsafe {
                 device
@@ -299,6 +361,16 @@ pub fn command_encoder_begin_render_pass(
     let fb_key = FramebufferKey {
         colors: color_attachments.iter().map(|at| at.attachment).collect(),
         depth_stencil: depth_stencil_attachment.map(|at| at.attachment),
+        resolves: if !color_attachments[0].resolve_target.is_null() {
+            Some(
+                color_attachments
+                    .iter()
+                    .map(|at| unsafe { *at.resolve_target.as_ref().expect("Expected resolve target") })
+                    .collect(),
+            )
+        } else {
+            None
+        },
     };
     let framebuffer = match framebuffer_cache.entry(fb_key) {
         Entry::Occupied(e) => e.into_mut(),
@@ -337,13 +409,13 @@ pub fn command_encoder_begin_render_pass(
                     use hal::format::ChannelType;
                     //TODO: validate sign/unsign and normalized ranges of the color values
                     let value = match key.format.unwrap().base_format().1 {
-                        ChannelType::Unorm |
-                        ChannelType::Snorm |
-                        ChannelType::Ufloat |
-                        ChannelType::Sfloat |
-                        ChannelType::Uscaled |
-                        ChannelType::Sscaled |
-                        ChannelType::Srgb => {
+                        ChannelType::Unorm
+                        | ChannelType::Snorm
+                        | ChannelType::Ufloat
+                        | ChannelType::Sfloat
+                        | ChannelType::Uscaled
+                        | ChannelType::Sscaled
+                        | ChannelType::Srgb => {
                             hal::command::ClearColor::Float(conv::map_color_f32(&at.clear_color))
                         }
                         ChannelType::Sint => {
@@ -353,7 +425,9 @@ pub fn command_encoder_begin_render_pass(
                             hal::command::ClearColor::Uint(conv::map_color_u32(&at.clear_color))
                         }
                     };
-                    Some(hal::command::ClearValueRaw::from(hal::command::ClearValue::Color(value)))
+                    Some(hal::command::ClearValueRaw::from(
+                        hal::command::ClearValue::Color(value),
+                    ))
                 }
             }
         })
@@ -362,7 +436,38 @@ pub fn command_encoder_begin_render_pass(
                 (LoadOp::Load, LoadOp::Load) => None,
                 (LoadOp::Clear, _) | (_, LoadOp::Clear) => {
                     let value = hal::command::ClearDepthStencil(at.clear_depth, at.clear_stencil);
-                    Some(hal::command::ClearValueRaw::from(hal::command::ClearValue::DepthStencil(value)))
+                    Some(hal::command::ClearValueRaw::from(
+                        hal::command::ClearValue::DepthStencil(value),
+                    ))
+                }
+            }
+        }))
+        .chain(color_attachments.iter().zip(&rp_key.colors).flat_map(|(at, key)| {
+            match at.load_op {
+                LoadOp::Load => None,
+                LoadOp::Clear => {
+                    use hal::format::ChannelType;
+                    //TODO: validate sign/unsign and normalized ranges of the color values
+                    let value = match key.format.unwrap().base_format().1 {
+                        ChannelType::Unorm
+                        | ChannelType::Snorm
+                        | ChannelType::Ufloat
+                        | ChannelType::Sfloat
+                        | ChannelType::Uscaled
+                        | ChannelType::Sscaled
+                        | ChannelType::Srgb => {
+                            hal::command::ClearColor::Float(conv::map_color_f32(&at.clear_color))
+                        }
+                        ChannelType::Sint => {
+                            hal::command::ClearColor::Int(conv::map_color_i32(&at.clear_color))
+                        }
+                        ChannelType::Uint => {
+                            hal::command::ClearColor::Uint(conv::map_color_u32(&at.clear_color))
+                        }
+                    };
+                    Some(hal::command::ClearValueRaw::from(
+                        hal::command::ClearValue::Color(value),
+                    ))
                 }
             }
         }));
@@ -391,6 +496,16 @@ pub fn command_encoder_begin_render_pass(
             .map(|at| view_guard[at.attachment].format)
             .collect(),
         depth_stencil: depth_stencil_attachment.map(|at| view_guard[at.attachment].format),
+        resolves: if !color_attachments[0].resolve_target.is_null() {
+            Some(
+                color_attachments
+                    .iter()
+                    .map(|at| view_guard[unsafe { *at.resolve_target.as_ref().unwrap() }].format)
+                    .collect(),
+            )
+        } else {
+            None
+        },
     };
 
     let index_state = IndexState {
